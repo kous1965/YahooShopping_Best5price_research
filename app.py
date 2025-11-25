@@ -10,6 +10,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+from webdriver_manager.core.os_manager import ChromeType # ★ここを追加
 from selenium.common.exceptions import TimeoutException
 
 # --- 定数設定 ---
@@ -24,7 +25,7 @@ st.markdown("JANコードのリストを入力し、「処理開始」ボタン�
 
 # --- サイドバー：設定 ---
 st.sidebar.header("設定")
-# クラウド上ではヘッドレス必須のため、チェックボックスは削除し常時ヘッドレスにします
+# クラウド上ではヘッドレス必須のためチェックボックス削除
 clear_sheet = st.sidebar.checkbox("実行前にシートをクリアする", value=True)
 
 # --- メインエリア：入力 ---
@@ -34,7 +35,7 @@ jan_input = st.text_area("JANコードリスト（1行に1つ入力）", height=
 def init_driver():
     options = webdriver.ChromeOptions()
     
-    # --- クラウド環境（Streamlit Cloud）で動作させるための必須オプション ---
+    # --- クラウド環境（Streamlit Cloud）用オプション ---
     options.add_argument('--headless') 
     options.add_argument('--no-sandbox') 
     options.add_argument('--disable-dev-shm-usage') 
@@ -45,12 +46,16 @@ def init_driver():
     options.add_argument('--disable-blink-features=AutomationControlled') 
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36")
     
-    # 【重要】Chromiumのバイナリ場所を明示的に指定
+    # Chromiumの場所を指定
     options.binary_location = "/usr/bin/chromium"
 
-    # WebDriverの自動インストールと起動
-    # packages.txtからドライバを消したため、ここでPythonが適切なバージョンをDLします
-    return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    # ★修正ポイント: chrome_type=ChromeType.CHROMIUM を指定してChromium用ドライバを取得させる
+    return webdriver.Chrome(
+        service=Service(
+            ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()
+        ),
+        options=options
+    )
 
 def run_scraping(jan_list):
     log_area = st.empty()
@@ -60,8 +65,7 @@ def run_scraping(jan_list):
         # スプレッドシート接続
         log_area.info(f"Googleスプレッドシート '{SPREADSHEET_NAME}' に接続中...")
         
-        # Streamlit CloudのSecretsから鍵情報を取得
-        # ※ローカルで動かす場合はここを元の記述に戻すか、secrets.tomlを用意する必要があります
+        # Secretsから鍵情報を取得
         key_dict = st.secrets["gcp_service_account"]
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
         creds = ServiceAccountCredentials.from_json_keyfile_dict(key_dict, scope)
@@ -70,7 +74,6 @@ def run_scraping(jan_list):
         
         if clear_sheet:
             sheet.clear()
-            # ヘッダーに「商品名」を追加
             header = ["JAN", "商品名", "順位", "店舗名", "価格(送料込)", "送料表記", "ポイント%", "ポイント額", "優良配送", "BONUS", "レビュー件数", "注文情報", "商品URL"]
             sheet.append_row(header)
         
@@ -174,7 +177,6 @@ def run_scraping(jan_list):
                     except:
                         pass
 
-                    # テキスト処理
                     raw_text = item.text
                     search_text = re.sub(r'\s+', ' ', raw_text)
                     clean_text_shipping = re.sub(r'\s+', '', raw_text)
@@ -200,7 +202,7 @@ def run_scraping(jan_list):
                     
                     if price == "取得失敗": continue
 
-                    # --- 商品名取得 ---
+                    # 商品名取得
                     product_name = ""
                     try:
                         name_elem = item.find_element(By.XPATH, ".//div[contains(@class, 'elName')]//a | .//div[contains(@class, 'SearchResultItem__title')]//a | .//p[contains(@class, 'elName')]//a")
@@ -218,7 +220,7 @@ def run_scraping(jan_list):
                                 break
                         except: pass
 
-                    # 店名チェック（正攻法）
+                    # 店名チェック
                     shop_name = ""
                     try:
                         se = item.find_element(By.XPATH, ".//*[contains(@class, 'Store') or contains(@class, 'store')]//a")
@@ -250,7 +252,6 @@ def run_scraping(jan_list):
 
                     is_bonus = "あり" if "BONUS" in raw_text or "bonus" in html_inner else "なし"
                     
-                    # ポイント計算
                     pt_match = re.search(r'(\d+)%', clean_text_shipping)
                     pt_pct_str = pt_match.group(1) if pt_match else "0"
                     pt_pct_display = pt_pct_str + "%" if pt_pct_str != "0" else ""
@@ -266,7 +267,6 @@ def run_scraping(jan_list):
                     except:
                         pt_val = ""
 
-                    # レビュー件数
                     rev_cnt = ""
                     rev_match = re.search(r'[（\(]([\d,]+)件[）\)]', raw_text)
                     if rev_match:
@@ -278,7 +278,6 @@ def run_scraping(jan_list):
                              if num_check.isdigit():
                                  rev_cnt = backup_match.group(1)
 
-                    # 注文情報
                     order_info = "なし"
                     if item_url:
                         try:
@@ -299,7 +298,6 @@ def run_scraping(jan_list):
                                 driver.close()
                                 driver.switch_to.window(driver.window_handles[0])
 
-                    # 転記
                     row = [jan, product_name, valid_count+1, shop_name, price, postage, pt_pct_display, pt_val, is_good, is_bonus, rev_cnt, order_info, item_url]
                     sheet.append_row(row)
                     valid_count += 1
