@@ -35,17 +35,21 @@ def init_driver():
     options = webdriver.ChromeOptions()
     
     # --- クラウド環境（Streamlit Cloud）で動作させるための必須オプション ---
-    options.add_argument('--headless') # 画面を表示しないモード（必須）
-    options.add_argument('--no-sandbox') # サンドボックスモードを無効化（必須）
-    options.add_argument('--disable-dev-shm-usage') # メモリ不足エラーの回避（必須）
-    options.add_argument('--disable-gpu') # GPUハードウェアアクセラレーションを無効化
-    options.add_argument('--window-size=1920,1080') # 画面サイズを指定（要素が見つからないエラー防止）
+    options.add_argument('--headless') 
+    options.add_argument('--no-sandbox') 
+    options.add_argument('--disable-dev-shm-usage') 
+    options.add_argument('--disable-gpu') 
+    options.add_argument('--window-size=1920,1080') 
     
-    # 自動操作の検知回避オプション
+    # 自動操作の検知回避
     options.add_argument('--disable-blink-features=AutomationControlled') 
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36")
     
-    # WebDriverの起動
+    # 【重要】Chromiumのバイナリ場所を明示的に指定
+    options.binary_location = "/usr/bin/chromium"
+
+    # WebDriverの自動インストールと起動
+    # packages.txtからドライバを消したため、ここでPythonが適切なバージョンをDLします
     return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
 
 def run_scraping(jan_list):
