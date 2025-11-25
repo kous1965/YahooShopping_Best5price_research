@@ -49,7 +49,8 @@ def run_scraping(jan_list):
         # スプレッドシート接続
         log_area.info(f"Googleスプレッドシート '{SPREADSHEET_NAME}' に接続中...")
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        creds = ServiceAccountCredentials.from_json_keyfile_name(JSON_FILE, scope)
+        key_dict = st.secrets["gcp_service_account"]
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(key_dict, scope)
         client = gspread.authorize(creds)
         sheet = client.open(SPREADSHEET_NAME).sheet1
         
