@@ -24,7 +24,7 @@ st.markdown("JANコードのリストを入力し、「処理開始」ボタン�
 
 # --- サイドバー：設定 ---
 st.sidebar.header("設定")
-use_headless = st.sidebar.checkbox("ヘッドレスモード（画面を表示しない）", value=False)
+# クラウド上ではヘッドレス必須のため、チェックボックスは削除し常時ヘッドレスにします
 clear_sheet = st.sidebar.checkbox("実行前にシートをクリアする", value=True)
 
 # --- メインエリア：入力 ---
@@ -33,12 +33,19 @@ jan_input = st.text_area("JANコードリスト（1行に1つ入力）", height=
 # --- ロジック関数 ---
 def init_driver():
     options = webdriver.ChromeOptions()
-    options.add_argument('--start-maximized')
+    
+    # --- クラウド環境（Streamlit Cloud）で動作させるための必須オプション ---
+    options.add_argument('--headless') # 画面を表示しないモード（必須）
+    options.add_argument('--no-sandbox') # サンドボックスモードを無効化（必須）
+    options.add_argument('--disable-dev-shm-usage') # メモリ不足エラーの回避（必須）
+    options.add_argument('--disable-gpu') # GPUハードウェアアクセラレーションを無効化
+    options.add_argument('--window-size=1920,1080') # 画面サイズを指定（要素が見つからないエラー防止）
+    
+    # 自動操作の検知回避オプション
     options.add_argument('--disable-blink-features=AutomationControlled') 
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36")
-    if use_headless:
-        options.add_argument('--headless')
     
+    # WebDriverの起動
     return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
 
 def run_scraping(jan_list):
@@ -48,8 +55,11 @@ def run_scraping(jan_list):
     try:
         # スプレッドシート接続
         log_area.info(f"Googleスプレッドシート '{SPREADSHEET_NAME}' に接続中...")
-        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        
+        # Streamlit CloudのSecretsから鍵情報を取得
+        # ※ローカルで動かす場合はここを元の記述に戻すか、secrets.tomlを用意する必要があります
         key_dict = st.secrets["gcp_service_account"]
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
         creds = ServiceAccountCredentials.from_json_keyfile_dict(key_dict, scope)
         client = gspread.authorize(creds)
         sheet = client.open(SPREADSHEET_NAME).sheet1
@@ -186,24 +196,19 @@ def run_scraping(jan_list):
                     
                     if price == "取得失敗": continue
 
-                    # --- 商品名取得 (追加箇所) ---
+                    # --- 商品名取得 ---
                     product_name = ""
                     try:
-                        # elName クラスなどを優先的に探す
                         name_elem = item.find_element(By.XPATH, ".//div[contains(@class, 'elName')]//a | .//div[contains(@class, 'SearchResultItem__title')]//a | .//p[contains(@class, 'elName')]//a")
                         product_name = name_elem.text.strip()
                     except:
                         pass
-                    
-                    # 取れなかった場合のバックアップ（文字数が長いリンクを探す）
                     if not product_name:
                         try:
                             links = item.find_elements(By.TAG_NAME, "a")
-                            # 文字数順にソート（長い順）
                             links_sorted = sorted(links, key=lambda x: len(x.text), reverse=True)
                             for link in links_sorted:
                                 txt = link.text.strip()
-                                # 店名などの除外条件
                                 if "円" in txt or "件" in txt or "最安値" in txt: continue
                                 product_name = txt
                                 break
@@ -290,7 +295,7 @@ def run_scraping(jan_list):
                                 driver.close()
                                 driver.switch_to.window(driver.window_handles[0])
 
-                    # 転記（商品名を追加）
+                    # 転記
                     row = [jan, product_name, valid_count+1, shop_name, price, postage, pt_pct_display, pt_val, is_good, is_bonus, rev_cnt, order_info, item_url]
                     sheet.append_row(row)
                     valid_count += 1
