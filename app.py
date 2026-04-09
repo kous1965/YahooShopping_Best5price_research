@@ -2,6 +2,8 @@ import streamlit as st
 import time
 import re
 import math
+import os
+import json
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from selenium import webdriver
@@ -10,88 +12,156 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
-from webdriver_manager.core.os_manager import ChromeType # ★ここを追加
+from webdriver_manager.core.os_manager import ChromeType
 from selenium.common.exceptions import TimeoutException
 
 # --- 定数設定 ---
 SPREADSHEET_NAME = 'YahooShopping_Price_Scraping'
-JSON_FILE = 'credentials.json'
 
 # --- ページ設定 ---
 st.set_page_config(page_title="Yahoo!ショッピング 最安値取得アプリ", layout="wide")
 
+
+# =============================================
+# ログイン認証
+# Cloud Run: 環境変数 APP_USERNAME / APP_PASSWORD を使用
+# ローカル開発: .streamlit/secrets.toml の [auth] セクションを使用
+# =============================================
+def check_login():
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+
+    if not st.session_state.authenticated:
+        st.title("🔐 ログイン")
+        st.markdown("ユーザー名とパスワードを入力してください。")
+
+        with st.form("login_form"):
+            username = st.text_input("ユーザー名")
+            password = st.text_input("パスワード", type="password")
+            submitted = st.form_submit_button("ログイン", type="primary")
+
+            if submitted:
+                # Cloud Run: 環境変数から認証情報を取得
+                valid_username = os.environ.get("APP_USERNAME", "")
+                valid_password = os.environ.get("APP_PASSWORD", "")
+
+                # ローカル開発: st.secrets から取得（フォールバック）
+                if not valid_username:
+                    try:
+                        valid_username = st.secrets["auth"]["username"]
+                        valid_password = st.secrets["auth"]["password"]
+                    except Exception:
+                        pass
+
+                if valid_username and username == valid_username and password == valid_password:
+                    st.session_state.authenticated = True
+                    st.rerun()
+                else:
+                    st.error("ユーザー名またはパスワードが違います")
+        st.stop()
+
+
+check_login()
+
+
+# =============================================
+# GCP認証情報の取得
+# Cloud Run: 環境変数 GCP_SERVICE_ACCOUNT_JSON（Secret Manager経由）を使用
+# ローカル開発: .streamlit/secrets.toml の [gcp_service_account] を使用
+# =============================================
+def get_gcp_credentials():
+    if "GCP_SERVICE_ACCOUNT_JSON" in os.environ:
+        # Cloud Run環境: Secret Managerから注入された環境変数
+        return json.loads(os.environ["GCP_SERVICE_ACCOUNT_JSON"])
+    else:
+        # ローカル開発: st.secretsから取得
+        return dict(st.secrets["gcp_service_account"])
+
+
+# =============================================
+# ログアウトボタン（サイドバー）
+# =============================================
+with st.sidebar:
+    if st.button("🚪 ログアウト"):
+        st.session_state.authenticated = False
+        st.rerun()
+
+
+# --- タイトル ---
 st.title("🛒 Yahoo!ショッピング 最安値スクレイピング & 転記アプリ")
 st.markdown("JANコードのリストを入力し、「処理開始」ボタンを押してください。")
 
 # --- サイドバー：設定 ---
 st.sidebar.header("設定")
-# クラウド上ではヘッドレス必須のためチェックボックス削除
 clear_sheet = st.sidebar.checkbox("実行前にシートをクリアする", value=True)
 
 # --- メインエリア：入力 ---
 jan_input = st.text_area("JANコードリスト（1行に1つ入力）", height=200, placeholder="4571697232075\n4904710437681")
 
+
 # --- ロジック関数 ---
 def init_driver():
     options = webdriver.ChromeOptions()
-    
-    # --- クラウド環境（Streamlit Cloud）用オプション ---
-    options.add_argument('--headless') 
-    options.add_argument('--no-sandbox') 
-    options.add_argument('--disable-dev-shm-usage') 
-    options.add_argument('--disable-gpu') 
-    options.add_argument('--window-size=1920,1080') 
-    
+
+    # --- Cloud Run / コンテナ環境用オプション ---
+    options.add_argument('--headless')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--disable-dev-shm-usage')
+    options.add_argument('--disable-gpu')
+    options.add_argument('--window-size=1920,1080')
+
     # 自動操作の検知回避
-    options.add_argument('--disable-blink-features=AutomationControlled') 
+    options.add_argument('--disable-blink-features=AutomationControlled')
     options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36")
-    
-    # Chromiumの場所を指定
+
+    # Chromiumのパスを指定
     options.binary_location = "/usr/bin/chromium"
 
-    # ★修正ポイント: chrome_type=ChromeType.CHROMIUM を指定してChromium用ドライバを取得させる
-    return webdriver.Chrome(
-        service=Service(
-            ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install()
-        ),
-        options=options
-    )
+    # Cloud Run: apt でインストールしたシステムのchromedriver を使用
+    # ローカル開発: webdriver-manager でダウンロード
+    if os.path.exists("/usr/bin/chromedriver"):
+        service = Service("/usr/bin/chromedriver")
+    else:
+        service = Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
+
+    return webdriver.Chrome(service=service, options=options)
+
 
 def run_scraping(jan_list):
     log_area = st.empty()
     progress_bar = st.progress(0)
-    
+
     try:
         # スプレッドシート接続
         log_area.info(f"Googleスプレッドシート '{SPREADSHEET_NAME}' に接続中...")
-        
-        # Secretsから鍵情報を取得
-        key_dict = st.secrets["gcp_service_account"]
+
+        key_dict = get_gcp_credentials()
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
         creds = ServiceAccountCredentials.from_json_keyfile_dict(key_dict, scope)
         client = gspread.authorize(creds)
         sheet = client.open(SPREADSHEET_NAME).sheet1
-        
+
         if clear_sheet:
             sheet.clear()
             header = ["JAN", "商品名", "順位", "店舗名", "価格(送料込)", "送料表記", "ポイント%", "ポイント額", "優良配送", "BONUS", "レビュー件数", "注文情報", "商品URL"]
             sheet.append_row(header)
-        
+
         log_area.success("スプレッドシート接続完了。ブラウザを起動します...")
-        
+
         driver = init_driver()
         wait = WebDriverWait(driver, 30)
-        
+
         total_jans = len(jan_list)
-        
+
         for i, jan in enumerate(jan_list):
             jan = jan.strip()
-            if not jan: continue
-            
+            if not jan:
+                continue
+
             progress = (i) / total_jans
             progress_bar.progress(progress)
             log_area.info(f"[{i+1}/{total_jans}] 処理中 JAN: {jan}")
-            
+
             try:
                 # 1. 検索
                 driver.get(f"https://shopping.yahoo.co.jp/search?first=1&tab_ex=commerce&fr=shp-prop&p={jan}")
@@ -102,7 +172,7 @@ def run_scraping(jan_list):
                     product_link = wait.until(EC.element_to_be_clickable((By.XPATH, "//a[contains(@href, '/products/') and not(contains(@href, 'search'))]")))
                     driver.get(product_link.get_attribute("href"))
                     time.sleep(5)
-                except:
+                except Exception:
                     st.warning(f"JAN: {jan} の製品ページが見つかりませんでした。スキップします。")
                     continue
 
@@ -112,7 +182,7 @@ def run_scraping(jan_list):
                     if list_view_btn:
                         driver.execute_script("arguments[0].click();", list_view_btn[0])
                         time.sleep(3)
-                except:
+                except Exception:
                     pass
 
                 # 4. 「送料込み」へ切り替え（リトライロジック）
@@ -137,8 +207,7 @@ def run_scraping(jan_list):
                                 if (o.innerText.includes("送料込みの価格")) { o.click(); }
                             }
                         """)
-                        
-                        # 確認待機
+
                         check_start = time.time()
                         while time.time() - check_start < 10:
                             curr_text = driver.find_element(By.TAG_NAME, "body").text
@@ -151,30 +220,34 @@ def run_scraping(jan_list):
                                     switched = True
                                     break
                             time.sleep(1)
-                        
+
                         if switched:
                             time.sleep(3)
                             break
                         else:
                             driver.refresh()
                             time.sleep(5)
-                    except:
+                    except Exception:
                         driver.refresh()
                         time.sleep(5)
-                
+
                 # 5. データ取得
                 items = driver.find_elements(By.XPATH, "//li[contains(@class, 'elItem')]")
-                if not items: items = driver.find_elements(By.XPATH, "//div[contains(@class, 'LoopList__item')]")
-                if not items: items = driver.find_elements(By.XPATH, "//div[contains(@class, 'SearchResultItem')]")
-                if not items: items = driver.find_elements(By.XPATH, "//li[descendant::span[contains(text(), '円')] and descendant::a]")
-                
+                if not items:
+                    items = driver.find_elements(By.XPATH, "//div[contains(@class, 'LoopList__item')]")
+                if not items:
+                    items = driver.find_elements(By.XPATH, "//div[contains(@class, 'SearchResultItem')]")
+                if not items:
+                    items = driver.find_elements(By.XPATH, "//li[descendant::span[contains(text(), '円')] and descendant::a]")
+
                 valid_count = 0
                 for item in items:
-                    if valid_count >= 5: break
-                    
+                    if valid_count >= 5:
+                        break
+
                     try:
                         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", item)
-                    except:
+                    except Exception:
                         pass
 
                     raw_text = item.text
@@ -188,26 +261,29 @@ def run_scraping(jan_list):
                     else:
                         pm = re.search(r'送料([0-9,]+)円', clean_text_shipping)
                         postage = f"送料{pm.group(1)}円" if pm else "送料別"
-                    
-                    if postage == "送料別": continue
+
+                    if postage == "送料別":
+                        continue
 
                     # 価格チェック
                     price = "取得失敗"
                     try:
                         pe = item.find_element(By.XPATH, ".//span[contains(@class, 'elPriceValue')]")
                         price = pe.text + "円"
-                    except:
+                    except Exception:
                         pm = re.search(r'([0-9,]+)\s*円', search_text)
-                        if pm: price = pm.group(1) + "円"
-                    
-                    if price == "取得失敗": continue
+                        if pm:
+                            price = pm.group(1) + "円"
+
+                    if price == "取得失敗":
+                        continue
 
                     # 商品名取得
                     product_name = ""
                     try:
                         name_elem = item.find_element(By.XPATH, ".//div[contains(@class, 'elName')]//a | .//div[contains(@class, 'SearchResultItem__title')]//a | .//p[contains(@class, 'elName')]//a")
                         product_name = name_elem.text.strip()
-                    except:
+                    except Exception:
                         pass
                     if not product_name:
                         try:
@@ -215,10 +291,12 @@ def run_scraping(jan_list):
                             links_sorted = sorted(links, key=lambda x: len(x.text), reverse=True)
                             for link in links_sorted:
                                 txt = link.text.strip()
-                                if "円" in txt or "件" in txt or "最安値" in txt: continue
+                                if "円" in txt or "件" in txt or "最安値" in txt:
+                                    continue
                                 product_name = txt
                                 break
-                        except: pass
+                        except Exception:
+                            pass
 
                     # 店名チェック
                     shop_name = ""
@@ -228,43 +306,48 @@ def run_scraping(jan_list):
                         if not shop_name:
                             img = se.find_element(By.TAG_NAME, "img")
                             shop_name = img.get_attribute("alt")
-                    except:
+                    except Exception:
                         pass
-                    
+
                     # URL/IDチェック
                     item_url = ""
                     try:
                         item_url = item.find_element(By.TAG_NAME, "a").get_attribute("href")
-                    except: pass
-                    
+                    except Exception:
+                        pass
+
                     if not shop_name and item_url and 'store.shopping.yahoo.co.jp' in item_url:
-                        try: shop_name = item_url.split('/')[3] + " (ID)"
-                        except: shop_name = "店舗名不明"
+                        try:
+                            shop_name = item_url.split('/')[3] + " (ID)"
+                        except Exception:
+                            shop_name = "店舗名不明"
 
                     # その他情報
                     is_good = "あり" if ("優良配送" in raw_text) or ("icon_delivery_excellent" in html_inner) else "なし"
                     if is_good == "なし":
-                         try:
-                             for img in item.find_elements(By.TAG_NAME, "img"):
-                                 if "優良配送" in img.get_attribute("alt"):
-                                     is_good = "あり"; break
-                         except: pass
+                        try:
+                            for img in item.find_elements(By.TAG_NAME, "img"):
+                                if "優良配送" in img.get_attribute("alt"):
+                                    is_good = "あり"
+                                    break
+                        except Exception:
+                            pass
 
                     is_bonus = "あり" if "BONUS" in raw_text or "bonus" in html_inner else "なし"
-                    
+
                     pt_match = re.search(r'(\d+)%', clean_text_shipping)
                     pt_pct_str = pt_match.group(1) if pt_match else "0"
                     pt_pct_display = pt_pct_str + "%" if pt_pct_str != "0" else ""
-                    
+
                     try:
                         price_num = int(re.sub(r'[^\d]', '', price))
                         pct_num = int(pt_pct_str)
                         if price_num > 0 and pct_num > 0:
                             val = math.floor(price_num * pct_num / 100)
-                            pt_val = f"{val:,}" 
+                            pt_val = f"{val:,}"
                         else:
                             pt_val = ""
-                    except:
+                    except Exception:
                         pt_val = ""
 
                     rev_cnt = ""
@@ -274,9 +357,9 @@ def run_scraping(jan_list):
                     else:
                         backup_match = re.search(r'([\d,]+)件', raw_text)
                         if backup_match:
-                             num_check = backup_match.group(1).replace(",", "")
-                             if num_check.isdigit():
-                                 rev_cnt = backup_match.group(1)
+                            num_check = backup_match.group(1).replace(",", "")
+                            if num_check.isdigit():
+                                rev_cnt = backup_match.group(1)
 
                     order_info = "なし"
                     if item_url:
@@ -290,21 +373,22 @@ def run_scraping(jan_list):
                                     if phrase in line:
                                         order_info = line.strip()
                                         break
-                                if order_info != "なし": break
+                                if order_info != "なし":
+                                    break
                             driver.close()
                             driver.switch_to.window(driver.window_handles[0])
-                        except:
+                        except Exception:
                             if len(driver.window_handles) > 1:
                                 driver.close()
                                 driver.switch_to.window(driver.window_handles[0])
 
-                    row = [jan, product_name, valid_count+1, shop_name, price, postage, pt_pct_display, pt_val, is_good, is_bonus, rev_cnt, order_info, item_url]
+                    row = [jan, product_name, valid_count + 1, shop_name, price, postage, pt_pct_display, pt_val, is_good, is_bonus, rev_cnt, order_info, item_url]
                     sheet.append_row(row)
                     valid_count += 1
-            
+
             except Exception as e:
                 st.error(f"JAN: {jan} の処理中にエラーが発生しました: {e}")
-        
+
         progress_bar.progress(100)
         log_area.success("すべての処理が完了しました！スプレッドシートを確認してください。")
         st.balloons()
@@ -314,6 +398,7 @@ def run_scraping(jan_list):
     finally:
         if 'driver' in locals():
             driver.quit()
+
 
 # --- ボタン ---
 if st.button("スクレイピング開始", type="primary"):
